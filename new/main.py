@@ -1,5 +1,26 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import time
+from typing import Dict
+
+import numpy as np
+from utils import Config,Logger,Database,PairScorer,StrategyManager,BacktestEngine,RiskManager,SystemDiagnostics,Strategy,DateTimeUtils
+from filter import FilterChain,MultiIndicatorAnalyzer,TrendAnalyzer
+from api import BinanceAPI
+
+# 导入ML（可选）
+try:
+    from ml import MLOptimizer, ML_AVAILABLE
+except ImportError:
+    ML_AVAILABLE = False
+    MLOptimizer = None
+
+
 
 # ==================== 主交易引擎 ====================
+import signal
+
+
 class TradingEngine:
     """优化的主交易引擎"""
 
@@ -12,13 +33,15 @@ class TradingEngine:
         self.strategy_manager = StrategyManager(config)
         self.backtest_engine = BacktestEngine(self.api, config, self.logger)
         self.risk_manager = RiskManager(config, self.db, self.logger)
+        self.multi_indicator = MultiIndicatorAnalyzer(config)
+        self.trend_analyzer = TrendAnalyzer(config)
 
         self.selected_pairs = []
         self.strategy_scores = {}
         self.running = False
 
         # 信号过滤器
-        self.signal_filter = SignalFilter(config, self.logger)
+        self.signal_filter = FilterChain(config, self.logger,multi_indicator=self.multi_indicator,trend_analyzer=self.trend_analyzer)
 
         # ML优化器
         if config.ENABLE_ML_OPTIMIZATION:
@@ -63,12 +86,13 @@ class TradingEngine:
 
         # 回测优化策略
         self.optimize_strategies()
+        
 
         # # 初始化ML模型（如果启用）
         # if self.ml_optimizer and self.config.ENABLE_ML_OPTIMIZATION:
         #     self.logger.info("[ML] 开始初始化训练模型...")
         #     trained_count = 0
-        #     for symbol in self.selected_pairs[:3]:  # 只训练前3个币对
+        #     for symbol in self.selected_pairs[:5]:  # 只训练前3个币对
         #         for strategy in self.strategy_manager.get_all_strategies():
         #             try:
         #                 if self.ml_optimizer.train_model(self.api, symbol, strategy):
@@ -103,7 +127,7 @@ class TradingEngine:
         with ThreadPoolExecutor(max_workers=3) as executor:
             future_to_strategy = {}
             for strategy in self.strategy_manager.get_all_strategies():
-                # 在3币对上测试
+                # 在5币对上测试
                 future = executor.submit(self._evaluate_strategy, strategy)
                 future_to_strategy[future] = strategy
 
@@ -140,7 +164,7 @@ class TradingEngine:
     def _evaluate_strategy(self, strategy: Strategy) -> float:
         """评估单个策略"""
         scores = []
-        for symbol in self.selected_pairs[:3]:
+        for symbol in self.selected_pairs[:5]:
             result = self.backtest_engine.backtest_strategy(strategy, symbol)
             if result["trades"] > 0:
                 scores.append(result["sharpe"])
@@ -211,7 +235,7 @@ class TradingEngine:
 
             if strategy.should_enter(df):
                 # 应用信号过滤器
-                if not self.signal_filter.filter_signal(df, 1, symbol, strategy.name):
+                if not self.signal_filter.filter(df, 1, symbol, strategy.name):
                     return
 
                 # ML预测信号质量
@@ -246,77 +270,63 @@ class TradingEngine:
             self.logger.error(f"检查信号错误 {symbol}: {e}")
 
     def enter_position(self, symbol: str, strategy: Strategy):
-        """进入持仓 - 增强安全检查"""
-        try:
-            # 检查是否已有持仓
-            if self.db.has_open_position(symbol, strategy.name):
-                return
-
-            # 再次检查持仓限制 (防止并发问题)
-            if len(self.db.get_open_positions()) >= self.config.MAX_POSITIONS:
-                self.logger.warning(f"[SKIP] 已达持仓上限: {symbol}")
-                return
-
+        """进入持仓 - 使用工具类优化"""
+        from utils import PositionCalculator, ExceptionHandler
+        
+        def _execute():
+            # 使用工具类计算仓位
             balance = self.api.get_balance()
-            if balance["free"] < self.config.MIN_TRADE_AMOUNT:
-                self.logger.warning(f"[SKIP] 余额不足: {balance['free']:.2f} USDT")
-                return
-
             current_price = self.api.get_ticker_price(symbol)
             if not current_price or current_price <= 0:
                 self.logger.error(f"[ERROR] 无效价格: {symbol}")
                 return
-
-            # 计算仓位
-            amount = self.risk_manager.calculate_position_size(
-                balance["free"], current_price
+            
+            # 使用PositionCalculator计算仓位
+            calc_result = PositionCalculator.calculate_entry_position(
+                balance["free"], current_price, self.config, self.risk_manager
             )
-            if amount == 0:
-                self.logger.warning(f"[SKIP] 仓位计算为0: {symbol}")
+            
+            if calc_result['error']:
+                self.logger.warning(f"[SKIP] {symbol}: {calc_result['error']}")
                 return
-
-            position_value = amount * current_price
-
-            # 检查最小金额
-            if position_value < self.config.MIN_TRADE_AMOUNT:
-                self.logger.warning(
-                    f"[SKIP] 金额不足: {symbol} ({position_value:.2f} < {self.config.MIN_TRADE_AMOUNT})"
-                )
-                return
-
-            # 检查余额充足
-            fee_estimate = position_value * 0.002  # 0.2%手续费估算
-            if position_value + fee_estimate > balance["free"]:
-                self.logger.warning(f"[SKIP] 余额不足以支付手续费: {symbol}")
-                return
-
+            
+            amount = calc_result['amount']
+            position_value = calc_result['position_value']
+            
             # 计算止损价
             stop_loss_price = current_price * (1 - self.config.MAX_LOSS_PER_TRADE)
-
+            
             # 创建订单
             order = self.api.create_order(symbol, "buy", amount, strategy=strategy.name)
-
+            
             if order and "id" in order:
                 # 获取实际成交价格
                 actual_price = order.get("price", current_price)
                 actual_amount = order.get("filled", amount)
-
-                # 保存持仓
-                position_id = self.db.save_position(
-                    symbol,
-                    strategy.name,
-                    "buy",
-                    actual_price,
-                    actual_amount,
-                    stop_loss_price,
-                )
-
-                # 保存交易
-                fee = position_value * self.api.get_trading_fee(symbol)
-                self.db.save_trade(
-                    symbol, strategy.name, "buy", actual_price, actual_amount, fee
-                )
-
+                
+                # 保存持仓（使用数据库事务确保原子性）
+                with self.db.transaction():
+                    # 再次检查持仓（防止并发问题）
+                    if self.db.has_open_position(symbol, strategy.name):
+                        self.logger.warning(f"[SKIP] {symbol} 已有持仓，跳过")
+                        return
+                    
+                    if len(self.db.get_open_positions()) >= self.config.MAX_POSITIONS:
+                        self.logger.warning(f"[SKIP] 已达持仓上限: {symbol}")
+                        return
+                    
+                    position_id = self.db.save_position(
+                        symbol, strategy.name, "buy",
+                        actual_price, actual_amount, stop_loss_price
+                    )
+                    
+                    # 保存交易
+                    fee = position_value * self.api.get_trading_fee(symbol)
+                    self.db.save_trade(
+                        symbol, strategy.name, "buy",
+                        actual_price, actual_amount, fee
+                    )
+                
                 self.logger.info(
                     f"[SUCCESS] 开仓: {symbol} | 策略:{strategy.name} | "
                     f"价格:{actual_price:.8f} | 金额:{position_value:.2f} USDT | "
@@ -324,12 +334,8 @@ class TradingEngine:
                 )
             else:
                 self.logger.error(f"[ERROR] 订单创建失败: {symbol}")
-
-        except Exception as e:
-            import traceback
-
-            self.logger.error(f"开仓失败 {symbol}: {e}")
-            self.logger.error(f"详情: {traceback.format_exc()}")
+        
+        ExceptionHandler.safe_execute(_execute, self.logger)
 
     def check_exit_signals(self):
         """检查出场信号"""
@@ -348,15 +354,8 @@ class TradingEngine:
                     continue
 
                 # 检查强制平仓时间
-                entry_time_str = position["entry_time"].replace("Z", "+00:00")
-                entry_time = datetime.fromisoformat(entry_time_str)
-
-                if entry_time.tzinfo is not None:
-                    now = datetime.now(entry_time.tzinfo)
-                else:
-                    now = datetime.now()
-
-                hold_hours = (now - entry_time).total_seconds() / 3600
+                entry_time = DateTimeUtils.parse_datetime(position["entry_time"])
+                hold_hours = DateTimeUtils.calculate_duration(entry_time)
                 if hold_hours > self.config.FORCE_EXIT_HOURS:
                     self.exit_position(
                         position, current_price, f"持仓超时({hold_hours:.0f}h)"
@@ -382,87 +381,63 @@ class TradingEngine:
                 self.logger.error(f"检查出场失败 {position['symbol']}: {e}")
 
     def exit_position(self, position: Dict, exit_price: float, reason: str):
-        """退出持仓 - 增强错误处理"""
-        try:
+        """退出持仓 - 使用工具类优化"""
+        from utils import PositionCalculator, ExceptionHandler
+        
+        def _execute():
             symbol = position["symbol"]
             amount = position["amount"]
-
+            
             # 验证数据有效性
             if amount <= 0 or exit_price <= 0:
                 self.logger.error(
                     f"[ERROR] 无效的平仓参数: {symbol} amount={amount} price={exit_price}"
                 )
                 return
-
+            
             # 创建卖单
             order = self.api.create_order(
                 symbol, "sell", amount, strategy=position["strategy"]
             )
-
+            
             if order and "id" in order:
                 # 获取实际成交价格
                 actual_exit_price = order.get("price", exit_price)
                 actual_amount = order.get("filled", amount)
-
-                # 计算盈亏
-                entry_value = position["entry_price"] * position["amount"]
-                exit_value = actual_exit_price * actual_amount
-                fee = exit_value * self.api.get_trading_fee(symbol)
-
-                # 净盈亏 = 卖出金额 - 买入金额 - 手续费
-                pnl = exit_value - entry_value - fee
-                pnl_pct = (pnl / entry_value) * 100 if entry_value > 0 else 0
-
-                # 更新持仓
-                self.db.update_position(position["id"], actual_exit_price, pnl)
-
-                # 保存交易
-                self.db.save_trade(
-                    symbol,
-                    position["strategy"],
-                    "sell",
-                    actual_exit_price,
-                    actual_amount,
-                    fee,
+                
+                # 使用PositionCalculator计算盈亏
+                fee = actual_exit_price * actual_amount * self.api.get_trading_fee(symbol)
+                pnl_result = PositionCalculator.calculate_pnl(
+                    position["entry_price"], position["amount"],
+                    actual_exit_price, actual_amount, fee
                 )
-
-                emoji = "[WIN]" if pnl > 0 else "[LOSS]"
+                
+                # 使用事务更新数据库
+                with self.db.transaction():
+                    self.db.update_position(position["id"], actual_exit_price, pnl_result['pnl'])
+                    self.db.save_trade(
+                        symbol, position["strategy"], "sell",
+                        actual_exit_price, actual_amount, fee
+                    )
+                
+                emoji = "[WIN]" if pnl_result['pnl'] > 0 else "[LOSS]"
                 self.logger.info(
                     f"{emoji} 平仓: {symbol} | {reason} | "
                     f"入场:{position['entry_price']:.8f} 出场:{actual_exit_price:.8f} | "
-                    f"盈亏: {pnl:.2f} USDT ({pnl_pct:+.2f}%) | "
+                    f"盈亏: {pnl_result['pnl']:.2f} USDT ({pnl_result['pnl_pct']:+.2f}%) | "
                     f"持仓时间: {self._calculate_hold_time(position)}"
                 )
             else:
                 self.logger.error(f"[ERROR] 平仓订单创建失败: {symbol}")
-
-        except Exception as e:
-            import traceback
-
-            self.logger.error(f"平仓失败 {symbol}: {e}")
-            self.logger.error(f"详情: {traceback.format_exc()}")
+        
+        ExceptionHandler.safe_execute(_execute, self.logger)
 
     def _calculate_hold_time(self, position: Dict) -> str:
-        """计算持仓时间 - 修复时区问题"""
+        """计算持仓时间 - 使用DateTimeUtils统一处理"""
         try:
-            # 处理时区
-            entry_time_str = position["entry_time"].replace("Z", "+00:00")
-            entry_time = datetime.fromisoformat(entry_time_str)
-
-            # 统一使用UTC时间
-            if entry_time.tzinfo is not None:
-                now = datetime.now(entry_time.tzinfo)
-            else:
-                now = datetime.now()
-
-            hold_seconds = (now - entry_time).total_seconds()
-
-            if hold_seconds < 3600:
-                return f"{hold_seconds/60:.0f}m"
-            elif hold_seconds < 86400:
-                return f"{hold_seconds/3600:.1f}h"
-            else:
-                return f"{hold_seconds/86400:.1f}d"
+            entry_time = DateTimeUtils.parse_datetime(position["entry_time"])
+            hold_hours = DateTimeUtils.calculate_duration(entry_time)
+            return DateTimeUtils.format_duration(hold_hours)
         except Exception as e:
             self.logger.error(f"计算持仓时间失败: {e}")
             return "N/A"
@@ -549,22 +524,10 @@ class TradingEngine:
                             pnl = (current_price - pos["entry_price"]) * pos["amount"]
                             pnl_pct = (pnl / (pos["entry_price"] * pos["amount"])) * 100
 
-                            # 修复持仓时间计算 - 统一时区
-                            entry_time_str = pos["entry_time"].replace("Z", "+00:00")
-                            entry_time = datetime.fromisoformat(entry_time_str)
-
-                            if entry_time.tzinfo is not None:
-                                now = datetime.now(entry_time.tzinfo)
-                            else:
-                                now = datetime.now()
-
-                            hold_time = (now - entry_time).total_seconds() / 3600
-
-                            # 格式化持仓时间
-                            if hold_time < 1:
-                                time_str = f"{hold_time*60:.0f}m"
-                            else:
-                                time_str = f"{hold_time:.1f}h"
+                            # 使用DateTimeUtils统一处理持仓时间
+                            entry_time = DateTimeUtils.parse_datetime(pos["entry_time"])
+                            hold_hours = DateTimeUtils.calculate_duration(entry_time)
+                            time_str = DateTimeUtils.format_duration(hold_hours)
 
                             self.logger.info(
                                 f"  {pos['symbol']:12} | {pos['strategy']:15} | "
@@ -653,7 +616,9 @@ class TradingEngine:
             self.logger.error(f"生成总结失败: {e}")
 
     def run(self):
-        """运行主循环 - 增强错误恢复"""
+        """运行主循环 - 增强错误恢复和资源管理"""
+        from utils import ExceptionHandler
+        
         if not self.initialize():
             self.logger.error("初始化失败")
             return
@@ -665,226 +630,114 @@ class TradingEngine:
         consecutive_errors = 0
         max_consecutive_errors = 5
 
-        while self.running:
-            try:
-                iteration += 1
-                self.logger.info(f"\n{'='*60}")
-                self.logger.info(
-                    f"第 {iteration} 次扫描 - {datetime.now().strftime('%H:%M:%S')}"
-                )
-                self.logger.info(f"{'='*60}")
-
-                # 同步持仓
-                if iteration % 10 == 0:
-                    self.sync_positions()
-
-                # 扫描入场信号
-                self.scan_signals()
-
-                # 检查出场信号
-                self.check_exit_signals()
-
-                # 保存账户状态
-                if iteration % 6 == 0:
-                    self.save_account_state()
-
-                # 每小时重新评分币对
-                if iteration % 60 == 0:
-                    self.logger.info("[UPDATE] 重新评分币对...")
-                    self.selected_pairs = self.scorer.select_top_pairs()
-
-                    # ML模型训练
-                    if (
-                        self.ml_optimizer
-                        and iteration % (self.config.ML_RETRAIN_HOURS * 60) == 0
-                    ):
-                        self.logger.info("[ML] 开始训练模型...")
-                        for symbol in self.selected_pairs[:3]:
-                            for strategy in self.strategy_manager.get_all_strategies():
-                                try:
-                                    self.ml_optimizer.train_model(
-                                        self.api, symbol, strategy
-                                    )
-                                except Exception as e:
-                                    self.logger.error(f"[ML] 训练失败 {symbol}: {e}")
-
-                # 显示简要状态
-                if iteration % 5 == 0:
-                    open_pos = len(self.db.get_open_positions())
-                    balance = self.api.get_balance()
+        try:
+            while self.running:
+                try:
+                    iteration += 1
+                    self.logger.info(f"\n{'='*60}")
                     self.logger.info(
-                        f"[STATUS] 持仓:{open_pos}/{self.config.MAX_POSITIONS} | "
-                        f"余额:{balance['free']:.2f} USDT | "
-                        f"连续错误:{consecutive_errors}"
+                        f"第 {iteration} 次扫描 - {datetime.now().strftime('%H:%M:%S')}"
+                    )
+                    self.logger.info(f"{'='*60}")
+
+                    # 同步持仓
+                    if iteration % 10 == 0:
+                        ExceptionHandler.safe_execute(
+                            self.sync_positions, self.logger
+                        )
+
+                    # 扫描入场信号
+                    ExceptionHandler.safe_execute(
+                        self.scan_signals, self.logger
                     )
 
-                # 重置错误计数
-                consecutive_errors = 0
-
-                # 等待下次扫描
-                time.sleep(self.config.SCAN_INTERVAL)
-
-            except KeyboardInterrupt:
-                self.logger.info("\n[SHUTDOWN] 用户中断")
-                break
-            except Exception as e:
-                consecutive_errors += 1
-                import traceback
-
-                error_details = traceback.format_exc()
-                self.logger.error(f"主循环错误 (第{consecutive_errors}次): {e}")
-                self.logger.error(f"错误详情:\n{error_details}")
-
-                # 连续错误过多,停止运行
-                if consecutive_errors >= max_consecutive_errors:
-                    self.logger.error(
-                        f"[FATAL] 连续错误{consecutive_errors}次,系统停止"
+                    # 检查出场信号
+                    ExceptionHandler.safe_execute(
+                        self.check_exit_signals, self.logger
                     )
+
+                    # 保存账户状态
+                    if iteration % 6 == 0:
+                        ExceptionHandler.safe_execute(
+                            self.save_account_state, self.logger
+                        )
+
+                    # 每小时重新评分币对
+                    if iteration % 60 == 0:
+                        self.logger.info("[UPDATE] 重新评分币对...")
+                        ExceptionHandler.safe_execute(
+                            lambda: setattr(self, 'selected_pairs', self.scorer.select_top_pairs()),
+                            self.logger
+                        )
+
+                        # ML模型训练
+                        if (
+                            self.ml_optimizer
+                            and iteration % (self.config.ML_RETRAIN_HOURS * 60) == 0
+                        ):
+                            self.logger.info("[ML] 开始训练模型...")
+                            for symbol in self.selected_pairs[:5]:
+                                for strategy in self.strategy_manager.get_all_strategies():
+                                    ExceptionHandler.safe_execute(
+                                        lambda s=symbol, st=strategy: self.ml_optimizer.train_model(self.api, s, st),
+                                        self.logger
+                                    )
+
+                    # 显示简要状态
+                    if iteration % 5 == 0:
+                        open_pos = len(self.db.get_open_positions())
+                        balance = self.api.get_balance()
+                        self.logger.info(
+                            f"[STATUS] 持仓:{open_pos}/{self.config.MAX_POSITIONS} | "
+                            f"余额:{balance['free']:.2f} USDT | "
+                            f"连续错误:{consecutive_errors}"
+                        )
+
+                    # 重置错误计数
+                    consecutive_errors = 0
+
+                    # 等待下次扫描
+                    time.sleep(self.config.SCAN_INTERVAL)
+
+                except KeyboardInterrupt:
+                    self.logger.info("\n[SHUTDOWN] 用户中断")
                     break
+                except Exception as e:
+                    consecutive_errors += 1
+                    import traceback
 
-                # 错误后等待更长时间
-                time.sleep(self.config.SCAN_INTERVAL * 2)
+                    error_details = traceback.format_exc()
+                    self.logger.error(f"主循环错误 (第{consecutive_errors}次): {e}")
+                    self.logger.error(f"错误详情:\n{error_details}")
 
+                    # 连续错误过多,停止运行
+                    if consecutive_errors >= max_consecutive_errors:
+                        self.logger.error(
+                            f"[FATAL] 连续错误{consecutive_errors}次,系统停止"
+                        )
+                        break
+
+                    # 错误后等待更长时间
+                    time.sleep(self.config.SCAN_INTERVAL * 2)
+        finally:
+            # 确保资源清理
+            self._cleanup_resources()
+        
         # 打印运行总结
         self.print_summary()
         self.logger.info("[STOP] 系统已停止")
-
-
-# ==================== 系统诊断工具 ====================
-class SystemDiagnostics:
-    """系统诊断和健康检查"""
-
-    def __init__(self, engine):
-        self.engine = engine
-        self.logger = engine.logger
-
-    def run_health_check(self) -> Dict:
-        """运行系统健康检查"""
-        self.logger.info("\n" + "=" * 60)
-        self.logger.info("系统健康检查")
-        self.logger.info("=" * 60)
-
-        health = {
-            "api_connection": self._check_api_connection(),
-            "database": self._check_database(),
-            "balance": self._check_balance(),
-            "positions": self._check_positions(),
-            "strategies": self._check_strategies(),
-            "ml_models": self._check_ml_models(),
-            "overall": "HEALTHY",
-        }
-
-        # 评估总体健康状态
-        issues = []
-        for key, status in health.items():
-            if key != "overall" and status != "OK":
-                issues.append(f"{key}: {status}")
-
-        if issues:
-            health["overall"] = "ISSUES_FOUND"
-            self.logger.warning(f"发现问题: {', '.join(issues)}")
-        else:
-            self.logger.info("系统健康状态: 良好")
-
-        self.logger.info("=" * 60 + "\n")
-        return health
-
-    def _check_api_connection(self) -> str:
-        """检查API连接"""
+    
+    def _cleanup_resources(self):
+        """清理资源"""
         try:
-            balance = self.engine.api.get_balance()
-            if balance["total"] > 0:
-                self.logger.info("[OK] API连接正常")
-                return "OK"
-            else:
-                self.logger.warning("[WARN] 余额为0")
-                return "WARN"
+            # 关闭数据库连接
+            if hasattr(self.db, '_local'):
+                for attr_name in dir(self.db._local):
+                    if attr_name == 'conn':
+                        conn = getattr(self.db._local, attr_name, None)
+                        if conn:
+                            conn.close()
         except Exception as e:
-            self.logger.error(f"[ERROR] API连接失败: {e}")
-            return "ERROR"
+            self.logger.error(f"资源清理失败: {e}")
 
-    def _check_database(self) -> str:
-        """检查数据库"""
-        try:
-            positions = self.engine.db.get_open_positions()
-            self.logger.info(f"[OK] 数据库正常 (持仓:{len(positions)})")
-            return "OK"
-        except Exception as e:
-            self.logger.error(f"[ERROR] 数据库错误: {e}")
-            return "ERROR"
 
-    def _check_balance(self) -> str:
-        """检查账户余额"""
-        try:
-            balance = self.engine.api.get_balance()
-            min_balance = self.engine.config.MIN_TRADE_AMOUNT * 2
-
-            if balance["free"] < min_balance:
-                self.logger.warning(
-                    f"[WARN] 可用余额不足: {balance['free']:.2f} < {min_balance:.2f}"
-                )
-                return "WARN"
-
-            self.logger.info(f"[OK] 余额充足: {balance['free']:.2f} USDT")
-            return "OK"
-        except Exception as e:
-            self.logger.error(f"[ERROR] 余额检查失败: {e}")
-            return "ERROR"
-
-    def _check_positions(self) -> str:
-        """检查持仓状态"""
-        try:
-            positions = self.engine.db.get_open_positions()
-
-            for pos in positions:
-                current_price = self.engine.api.get_ticker_price(pos["symbol"])
-                if current_price:
-                    pnl_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
-
-                    # 检查是否有严重亏损
-                    if pnl_pct < -0.05:  # 亏损>5%
-                        self.logger.warning(
-                            f"[WARN] {pos['symbol']} 亏损严重: {pnl_pct*100:.2f}%"
-                        )
-
-            self.logger.info(f"[OK] 持仓检查完成: {len(positions)}个")
-            return "OK"
-        except Exception as e:
-            self.logger.error(f"[ERROR] 持仓检查失败: {e}")
-            return "ERROR"
-
-    def _check_strategies(self) -> str:
-        """检查策略状态"""
-        try:
-            issues = []
-            for strategy_name, score in self.engine.strategy_scores.items():
-                if score < -5:
-                    issues.append(f"{strategy_name}(Sharpe:{score:.2f})")
-
-            if issues:
-                self.logger.warning(f"[WARN] 策略表现差: {', '.join(issues)}")
-                return "WARN"
-
-            self.logger.info("[OK] 策略状态正常")
-            return "OK"
-        except Exception as e:
-            self.logger.error(f"[ERROR] 策略检查失败: {e}")
-            return "ERROR"
-
-    def _check_ml_models(self) -> str:
-        """检查ML模型"""
-        if not self.engine.ml_optimizer:
-            self.logger.info("[N/A] ML功能未启用")
-            return "N/A"
-
-        try:
-            model_count = len(self.engine.ml_optimizer.models)
-            if model_count == 0:
-                self.logger.info("[INFO] 首次运行，ML模型将在后台训练")
-                return "OK"  # 首次运行没有模型是正常的
-
-            self.logger.info(f"[OK] ML模型: {model_count}个")
-            return "OK"
-        except Exception as e:
-            self.logger.error(f"[ERROR] ML检查失败: {e}")
-            return "ERROR"

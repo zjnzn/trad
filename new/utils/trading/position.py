@@ -2,7 +2,7 @@
 仓位计算工具类
 """
 from typing import Dict, Optional
-from utils.common import ValidationUtils
+from ..common.validators import ValidationUtils
 
 class PositionCalculator:
     """仓位计算工具类 - 提取重复的仓位计算逻辑"""

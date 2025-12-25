@@ -11,6 +11,9 @@ from utils.common import (
     TradingException, RetryDecorator
 )
 
+#策略管理
+from utils.strategy import StrategyManager,Strategy
+
 # 数据管理
 from utils.data import Database, CacheManager
 
@@ -32,6 +35,9 @@ __all__ = [
     'ExceptionHandler',
     'TradingException',
     'RetryDecorator',
+    #策略管理
+    "Strategy"
+    "StrategyManager",
     # 数据管理
     'Database',
     'CacheManager',

@@ -1,75 +1,34 @@
 
-# ==================== 策略管理器（工厂模式）====================
-class StrategyFactory:
-    """策略工厂 - 使用工厂模式创建策略"""
-    
-    _strategy_classes = {
-        "RSI_STRATEGY": RSIStrategy,
-        "MACD_STRATEGY": MACDStrategy,
-        "BOLLINGER_STRATEGY": BollingerStrategy,
-        "MA_CROSS_STRATEGY": MACrossStrategy,
-        "GRID_STRATEGY": GridStrategy,
-        "BREAKOUT_STRATEGY": BreakoutStrategy,
-        "MEAN_REVERSION_STRATEGY": MeanReversionStrategy,
-        "EMA_STRATEGY": EMAStrategy,
-        "MOMENTUM_STRATEGY": MomentumStrategy,
-    }
-    
-    @classmethod
-    def create_strategy(cls, name: str) -> Optional[Strategy]:
-        """创建策略实例"""
-        strategy_class = cls._strategy_classes.get(name)
-        if strategy_class:
-            return strategy_class()
-        return None
-    
-    @classmethod
-    def register_strategy(cls, name: str, strategy_class):
-        """注册新策略 - 提高可扩展性"""
-        cls._strategy_classes[name] = strategy_class
-    
-    @classmethod
-    def get_available_strategies(cls) -> List[str]:
-        """获取所有可用策略名称"""
-        return list(cls._strategy_classes.keys())
+# ==================== 策略基类 ====================
+from typing import Dict, List, Optional
+import pandas as pd
 
-class StrategyManager:
-    """策略管理器 - 使用工厂模式和管理模式"""
-
-    def __init__(self, config: Config):
-        self.config = config
-        self.factory = StrategyFactory
-        self.strategies = self._init_strategies()
-
-    def _init_strategies(self) -> Dict[str, Strategy]:
-        """初始化策略 - 延迟加载"""
-        strategies = {}
-        for name in self.config.STRATEGIES:
-            strategy = self.factory.create_strategy(name)
-            if strategy:
-                strategies[name] = strategy
-        return strategies
-
-    def get_strategy(self, name: str) -> Optional[Strategy]:
-        """获取策略 - 支持动态创建"""
-        if name in self.strategies:
-            return self.strategies[name]
-        # 尝试动态创建
-        strategy = self.factory.create_strategy(name)
-        if strategy:
-            self.strategies[name] = strategy
-        return strategy
-
-    def get_all_strategies(self) -> List[Strategy]:
-        """获取所有激活的策略"""
-        return list(self.strategies.values())
-    
-    def register_strategy(self, name: str, strategy_class):
-        """注册新策略"""
-        self.factory.register_strategy(name, strategy_class)
+from .config import Config
+from .analysis.indicators import IndicatorComputer
 
 
+class Strategy:
+    """优化的策略基类"""
 
+    def __init__(self, name: str):
+        self.name = name
+        self.params = {}
+
+    def calculate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """计算交易信号"""
+        raise NotImplementedError
+
+    def should_enter(self, df: pd.DataFrame) -> bool:
+        """是否应该入场"""
+        if len(df) < 2:
+            return False
+        return df["signal"].iloc[-1] == 1 and df["signal"].iloc[-2] != 1  # 避免重复信号
+
+    def should_exit(self, df: pd.DataFrame, position: Dict) -> bool:
+        """是否应该出场"""
+        if len(df) < 2:
+            return False
+        return df["signal"].iloc[-1] == -1
 
 # ==================== RSI策略 ====================
 class RSIStrategy(Strategy):
@@ -463,36 +422,75 @@ class MomentumStrategy(Strategy):
     
 
 
-# ==================== 策略管理器 ====================
+
+
+# ==================== 策略管理器（工厂模式）====================
+class StrategyFactory:
+    """策略工厂 - 使用工厂模式创建策略"""
+    
+    _strategy_classes = {
+        "RSI_STRATEGY": RSIStrategy,
+        "MACD_STRATEGY": MACDStrategy,
+        "BOLLINGER_STRATEGY": BollingerStrategy,
+        "MA_CROSS_STRATEGY": MACrossStrategy,
+        "GRID_STRATEGY": GridStrategy,
+        "BREAKOUT_STRATEGY": BreakoutStrategy,
+        "MEAN_REVERSION_STRATEGY": MeanReversionStrategy,
+        "EMA_STRATEGY": EMAStrategy,
+        "MOMENTUM_STRATEGY": MomentumStrategy,
+    }
+    
+    @classmethod
+    def create_strategy(cls, name: str) -> Optional[Strategy]:
+        """创建策略实例"""
+        strategy_class = cls._strategy_classes.get(name)
+        if strategy_class:
+            return strategy_class()
+        return None
+    
+    @classmethod
+    def register_strategy(cls, name: str, strategy_class):
+        """注册新策略 - 提高可扩展性"""
+        cls._strategy_classes[name] = strategy_class
+    
+    @classmethod
+    def get_available_strategies(cls) -> List[str]:
+        """获取所有可用策略名称"""
+        return list(cls._strategy_classes.keys())
+
 class StrategyManager:
-    """策略管理器"""
+    """策略管理器 - 使用工厂模式和管理模式"""
 
     def __init__(self, config: Config):
         self.config = config
+        self.factory = StrategyFactory
         self.strategies = self._init_strategies()
 
     def _init_strategies(self) -> Dict[str, Strategy]:
-        """初始化策略"""
-        return {
-            "RSI_STRATEGY": RSIStrategy(),
-            "MACD_STRATEGY": MACDStrategy(),
-            "BOLLINGER_STRATEGY": BollingerStrategy(),
-            "MA_CROSS_STRATEGY": MACrossStrategy(),
-            "GRID_STRATEGY": GridStrategy(),
-            "BREAKOUT_STRATEGY": BreakoutStrategy(),
-            "MEAN_REVERSION_STRATEGY": MeanReversionStrategy(),
-            "EMA_STRATEGY": EMAStrategy(),
-            "MOMENTUM_STRATEGY": MomentumStrategy(),
-        }
+        """初始化策略 - 延迟加载"""
+        strategies = {}
+        for name in self.config.STRATEGIES:
+            strategy = self.factory.create_strategy(name)
+            if strategy:
+                strategies[name] = strategy
+        return strategies
 
-    def get_strategy(self, name: str) -> Strategy:
-        """获取策略"""
-        return self.strategies.get(name)
+    def get_strategy(self, name: str) -> Optional[Strategy]:
+        """获取策略 - 支持动态创建"""
+        if name in self.strategies:
+            return self.strategies[name]
+        # 尝试动态创建
+        strategy = self.factory.create_strategy(name)
+        if strategy:
+            self.strategies[name] = strategy
+        return strategy
 
     def get_all_strategies(self) -> List[Strategy]:
         """获取所有激活的策略"""
-        return [
-            self.strategies[name]
-            for name in self.config.STRATEGIES
-            if name in self.strategies
-        ]
+        return list(self.strategies.values())
+    
+    def register_strategy(self, name: str, strategy_class):
+        """注册新策略"""
+        self.factory.register_strategy(name, strategy_class)
+
+

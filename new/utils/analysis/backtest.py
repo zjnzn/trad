@@ -5,8 +5,10 @@
 import numpy as np
 from typing import Dict
 
-from api import BinanceAPI
-from utils import Config, Logger
+from api.binance_api import BinanceAPI
+from ..logger import Logger
+from ..config import Config
+
 
 # ==================== 回测引擎 ====================
 class BacktestEngine:
@@ -223,4 +225,3 @@ class BacktestEngine:
         drawdown = (cumulative - running_max) / (running_max + 1000)  # 避免除零
         
         return abs(np.min(drawdown))
-

@@ -1,6 +1,10 @@
-
+from typing import Dict
+from utils import Config,IndicatorComputer
 
 # ==================== 多指标分析器 ====================
+import pandas as pd
+
+
 class MultiIndicatorAnalyzer:
     """多指标共振分析器"""
 
@@ -36,7 +40,7 @@ class MultiIndicatorAnalyzer:
         IndicatorComputer.compute_adx(df)
 
         # 成交量指标
-        IndicatorComputer.compute_volume_ma(20, df)
+        IndicatorComputer.compute_vol_ma(20, df)
         IndicatorComputer.compute_vol_ratio(df)
 
         # OBV (能量潮)

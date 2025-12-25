@@ -2,7 +2,6 @@
 技术指标计算模块
 """
 import pandas as pd
-import numpy as np
 
 class IndicatorComputer:
     """技术指标计算器 - 增加数据验证"""

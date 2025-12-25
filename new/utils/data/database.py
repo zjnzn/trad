@@ -6,7 +6,7 @@ import threading
 from contextlib import contextmanager
 from typing import List, Dict
 
-from utils import Config
+from ..config import Config
 
 # ==================== 数据库管理（优化连接池）====================
 class Database:

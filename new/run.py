@@ -1,3 +1,4 @@
+from utils import Config
 
 # ==================== 使用示例 ====================
 if __name__ == "__main__":
